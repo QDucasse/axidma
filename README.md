@@ -1,7 +1,13 @@
 # AXI DMA test
 
-This project sets up the AXI-DMA IP in a vivado design. It is built and versioned using [vivgit](https://github.com/QDucasse/vivgit).
+This project sets up the AXI-DMA IP in a vivado design, showing how to self-test and use the S2MM channel only with an asynchronous FIFO. It is built and versioned using [vivgit](https://github.com/QDucasse/vivgit).
 
+
+### Project Description
+
+Two projects are present in this repository:
+- `axidma`: a selftest module that links the MM2S into a FIFO back into S2MM and compares both results
+- `s2mm_async_ila`: this project uses a pattern generator feeding the FIFO in an asynchronous manner (from the AXI), with only the S2MM channel active. It sets up two ILA probes on both AXI connections to see their evolution.
 
 ### Installation
 
@@ -12,16 +18,16 @@ cd axidma
 git submodule update --init --recursive
 ```
 
-Create the project:
+Create the project (use `axidma` or `s2mm_async_ila`):
 ```bash
-vivado -mode batch scripts/create_project.tcl -tclargs axidma
-vivado -mode batch scripts/run_synth_impl.tcl -tclargs axidma
+vivado -mode batch scripts/create_project.tcl -tclargs <project-name>
+vivado -mode batch scripts/run_synth_impl.tcl -tclargs <project-name>
 ```
 
 From there, if you have a petalinux project:
 ```bash
 cd <plnx_project>
-petalinux-config --get-hw-description <path-to-axidma>/build/axidma/axidma.sdt
+petalinux-config --get-hw-description <path-to-axidma>/build/<project-name>/<project-name>.sdt
 ```
 
 Add a reserved memory part using [`udmabuf`](https://github.com/ikwzm/udmabuf) in `<plnx>/project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi`:
@@ -31,18 +37,19 @@ Add a reserved memory part using [`udmabuf`](https://github.com/ikwzm/udmabuf) i
         #address-cells= <2>;
         #size-cells= <2>;
         ranges;
-        axi_dma_buffer: axi_dma_buffer@68000000 {
+        dma_buffer: dma_buffer@68000000 {
             compatible = "shared-dma-pool";
             no-map;                                 // Incompatible with reusable
-            reg = <0x0 0x68000000 0x0 0x04000000>;  // Address, size (64MiB here)
-            label = "tpiu_buffer";                  // Label to use
+            reg = <0x0 0x68000000 0x0 0x04000000>;  // Address, size
+            label = "dma_buffer";                   // Label to use
         };
     };
-    udmabuf@68000000 {
-        compatible = "ikwzm,u-dma-buf";            // Name used in the driver
-        device-name = "axi_dma_buffer";            // Name of the buffer
+
+    udmabuf@60000000 {
+        compatible = "ikwzm,u-dma-buf";
+        device-name = "udmabuf0";                  // Name of the buffer
         size = <0x04000000>;                       // 64MiB
-        memory-region = <&axi_dma_buffer>;         // Link to the reserved-memory defined earlier
+        memory-region = <&dma_buffer>;             // Link to the reserved-memory defined earlier
     };
 };
 ```
@@ -65,7 +72,7 @@ This build generates the first stage bootloader that powers the PL part, use it 
 You then need to generate the overlay for the `pl.dtsi`:
 ```bash
 cd <plnx_project>
-dtc -@ -I dts -O dtb -o pl.dtbo components/plnx_workspace/device-tree/pl-overlay-full/pl.dtsi
+dtc -@ -I dts -O dtb -o pl.dtbo project-spec/configs/pl.dtsi
 ```
 
 > **WARNING:** From the `pl.dtsi`, modify the following line to the name of your `bin`:
@@ -90,7 +97,7 @@ cp axidma.bin /lib/firmware/axidma.bin
 fpgautil -b /lib/firmware/axidma.bin -o /lib/firmware/pl.dtbo
 ```
 
-You can then run the test program found in `src/dma_test.c`, taken from [this tutorial](https://www.hackster.io/whitney-knitter/introduction-to-using-axi-dma-in-embedded-linux-5264ec):
+You can then run the test program found in `src/dma_test.c`, taken from [this tutorial](https://www.hackster.io/whitney-knitter/introduction-to-using-axi-dma-in-embedded-linux-5264ec), or the adapted version `src/s2mm_test.c`:
 
 ```bash
 root@xilinx-zcu104:/home/root# gcc -O2 -o dma_test dma_test.c
