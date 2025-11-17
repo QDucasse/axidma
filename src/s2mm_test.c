@@ -182,7 +182,7 @@ void print_mem(void *virtual_address, int byte_count)
 
 int main()
 {
-    printf("Hello World! - Running TPIU AXI-DMA transfer test application.\n");
+    printf("Hello World! - Running S2MM Async test application.\n");
 
     printf("Opening a character device file of the ZynqMP's DDR memory...\n");
     int ddr_memory = open("/dev/mem", O_RDWR | O_SYNC);
@@ -192,7 +192,7 @@ int main()
 
 
     printf("Opening u-dma-buf character device for S2MM destination...\n");
-    int dma_buf_fd = open("/dev/tpiu-doctor0", O_RDWR); // use the device name exported by u-dma-buf
+    int dma_buf_fd = open("/dev/udmabuf0", O_RDWR); // use the device name exported by u-dma-buf
     if(dma_buf_fd < 0) {
         perror("Failed to open u-dma-buf device");
         return -1;
