@@ -5,9 +5,10 @@ This project sets up the AXI-DMA IP in a vivado design, showing how to self-test
 
 ### Project Description
 
-Two projects are present in this repository:
-- `axidma`: a selftest module that links the MM2S into a FIFO back into S2MM and compares both results
-- `s2mm_async_ila`: this project uses a pattern generator feeding the FIFO in an asynchronous manner (from the AXI), with only the S2MM channel active. It sets up two ILA probes on both AXI connections to see their evolution.
+Three projects are present in this repository:
+- `axidma`: a self-test design that loops MM2S through a FIFO back into S2MM, so both copies can be compared.
+- `s2mm_async`: a pattern generator in its own clock domain feeds an asynchronous AXIS FIFO into S2MM, with only the S2MM channel active. It is the reference design for `s2mm_test`.
+- `s2mm_async_ila`: `s2mm_async` plus two ILAs, one on each AXI-Stream side of the FIFO. It is an example of probing AXI-Stream interfaces and runs the same software.
 
 ### Installation
 
@@ -18,7 +19,7 @@ cd axidma
 git submodule update --init --recursive
 ```
 
-Create the project (use `axidma` or `s2mm_async_ila`):
+Create the project (use `axidma`, `s2mm_async` or `s2mm_async_ila`):
 ```bash
 make PROJECT=<project-name> synth impl   # .bit/.bin/.xsa under build/<project-name>
 make PROJECT=<project-name> sdt          # system device tree from the .xsa
@@ -111,7 +112,7 @@ Three examples are built on it:
 
 | Program | Design | What it does |
 |---|---|---|
-| `s2mm_test` | `s2mm_async_ila` | Captures the pattern generator's counter through S2MM, one transfer per TLAST-terminated packet, and checks the counter for gaps. It waits for Enter so the ILA can be armed (`-y` skips this). |
+| `s2mm_test` | `s2mm_async`, `s2mm_async_ila` | Captures the pattern generator's counter through S2MM, one transfer per TLAST-terminated packet, and checks the counter for gaps. It waits for Enter before starting the generator, so the ILA can be armed (`-y` skips this). |
 | `dma_test` | `axidma` | Loops a pseudo-random buffer MM2S → FIFO → S2MM and compares the two copies. |
 | `dma_dump` | any | Dumps (part of) the u-dma-buf to a file. |
 

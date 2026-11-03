@@ -1,5 +1,5 @@
 // s2mm_test.c
-// S2MM-only capture for the s2mm_async_ila design: axi_pattern_gen -> async
+// S2MM-only capture for the s2mm_async(_ila) designs: axi_pattern_gen -> async
 // AXIS FIFO -> AXI DMA S2MM -> u-dma-buf. The generator emits a 32-bit
 // counter with TLAST every FRAME_BYTES (32), so each S2MM transfer stops at
 // a packet boundary and is re-armed at the next free byte of the buffer.
