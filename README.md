@@ -20,9 +20,11 @@ git submodule update --init --recursive
 
 Create the project (use `axidma` or `s2mm_async_ila`):
 ```bash
-vivado -mode batch scripts/create_project.tcl -tclargs <project-name>
-vivado -mode batch scripts/run_synth_impl.tcl -tclargs <project-name>
+make PROJECT=<project-name> synth impl   # .bit/.bin/.xsa under build/<project-name>
+make PROJECT=<project-name> sdt          # system device tree from the .xsa
 ```
+
+`make help` lists the other targets (`overlay`/`dtbo` generate the device-tree overlay without petalinux, `deploy` stages the `.bin`/`.dtbo` to a board); see `scripts/README.md`.
 
 From there, if you have a petalinux project:
 ```bash
@@ -134,16 +136,6 @@ Leave the DMA to these programs: if the `pl.dtsi` binds the `axi_dma` node to th
 
 The experiment was run on a ZynqMP UltraScale+ ZCU104, using Vivado 2024.2 and petalinux-2024.2, you might have to adapt:
 
-- the part name
-    ```bash
-    # in scripts/create_project.tcl
-    set part_name "xczu7ev-ffvc1156-2-e"
-    ```
-
-- the board dts ()
-    ```bash
-    # in scripts/run_synth_impl.tcl
-    set board_dts "zcu104-revc"
-    ```
+- the board settings in `config.mk` (`PART_NAME`, `BOARD_NAME`, `BOARD_DTS`, `XILINX_VERSION`), whose commented defaults are the ZCU104 and 2024.2 values
 
 - and the addresses from your block design, which the programs take as compile-time defines (`DMA_BASE`, default `0x80000000`; `GPIO_BASE`, default `0x80010000`). The buffer address no longer needs to be set: it is read from `/sys/class/u-dma-buf/<name>/phys_addr`.
