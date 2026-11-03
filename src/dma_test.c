@@ -1,343 +1,145 @@
-/*
-* Copyright (C) 2013 - 2016  Xilinx, Inc.  All rights reserved.
-*
-* Permission is hereby granted, free of charge, to any person
-* obtaining a copy of this software and associated documentation
-* files (the "Software"), to deal in the Software without restriction,
-* including without limitation the rights to use, copy, modify, merge,
-* publish, distribute, sublicense, and/or sell copies of the Software,
-* and to permit persons to whom the Software is furnished to do so,
-* subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included
-* in all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-* IN NO EVENT SHALL XILINX  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-* CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*
-* Except as contained in this notice, the name of the Xilinx shall not be used
-* in advertising or otherwise to promote the sale, use or other dealings in this
-* Software without prior written authorization from Xilinx.
-*
-*/
+// dma_test.c
+// MM2S -> AXIS FIFO -> S2MM loopback self-test for the axidma design.
+// The source and destination both live in the u-dma-buf: the source at
+// offset 0, the destination at the next 4 KiB boundary after it. The source
+// is filled with a pseudo-random pattern, looped through the PL, and the
+// destination compared against it.
 
+#include <getopt.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
-#include <termios.h>
-#include <sys/mman.h>
 
-#define DMA_BASE  0x80000000
-#define MM2S_BASE 0x68000000
-#define S2MM_BASE 0x68010000
+#include "lib/axi_dma.h"
+#include "lib/udmabuf.h"
 
-#define MM2S_CONTROL_REGISTER       0x00
-#define MM2S_STATUS_REGISTER        0x04
-#define MM2S_SRC_ADDRESS_REGISTER   0x18
-#define MM2S_TRNSFR_LENGTH_REGISTER 0x28
+#ifndef DMA_BASE
+#define DMA_BASE        0x80000000
+#endif
 
-#define S2MM_CONTROL_REGISTER       0x30
-#define S2MM_STATUS_REGISTER        0x34
-#define S2MM_DST_ADDRESS_REGISTER   0x48
-#define S2MM_BUFF_LENGTH_REGISTER   0x58
+#define DEFAULT_UDMABUF "udmabuf0"
+#define DEFAULT_BYTES   4096
+#define WAIT_TIMEOUT_S  1.0
 
-#define IOC_IRQ_FLAG                1<<12
-#define IDLE_FLAG                   1<<1
-
-#define STATUS_HALTED               0x00000001
-#define STATUS_IDLE                 0x00000002
-#define STATUS_SG_INCLDED           0x00000008
-#define STATUS_DMA_INTERNAL_ERR     0x00000010
-#define STATUS_DMA_SLAVE_ERR        0x00000020
-#define STATUS_DMA_DECODE_ERR       0x00000040
-#define STATUS_SG_INTERNAL_ERR      0x00000100
-#define STATUS_SG_SLAVE_ERR         0x00000200
-#define STATUS_SG_DECODE_ERR        0x00000400
-#define STATUS_IOC_IRQ              0x00001000
-#define STATUS_DELAY_IRQ            0x00002000
-#define STATUS_ERR_IRQ              0x00004000
-
-#define HALT_DMA                    0x00000000
-#define RUN_DMA                     0x00000001
-#define RESET_DMA                   0x00000004
-#define ENABLE_IOC_IRQ              0x00001000
-#define ENABLE_DELAY_IRQ            0x00002000
-#define ENABLE_ERR_IRQ              0x00004000
-#define ENABLE_ALL_IRQ              0x00007000
-
-unsigned int write_dma(unsigned int *virtual_addr, int offset, unsigned int value)
+static void usage(const char *prog)
 {
-    virtual_addr[offset>>2] = value;
-
-    return 0;
+    fprintf(stderr,
+        "usage: %s [-d udmabuf] [-n bytes] [-s seed] [-u]\n"
+        "  -d  u-dma-buf device (default " DEFAULT_UDMABUF ")\n"
+        "  -n  bytes to loop back (default %d)\n"
+        "  -s  pattern seed\n"
+        "  -u  map the buffer uncached instead of cached + sync\n",
+        prog, DEFAULT_BYTES);
 }
 
-unsigned int read_dma(unsigned int *virtual_addr, int offset)
+static void hexdump(const char *label, const void *p, size_t n)
 {
-    return virtual_addr[offset>>2];
+    const uint8_t *b = p;
+    printf("%-12s", label);
+    for (size_t i = 0; i < n; i++)
+        printf("%02x%s", b[i], (i % 4 == 3) ? " " : "");
+    putchar('\n');
 }
 
-void dma_s2mm_status(unsigned int *virtual_addr)
+static void fill_pattern(uint8_t *p, size_t n, uint32_t seed)
 {
-    unsigned int status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-
-    printf("Stream to memory-mapped status (0x%08x@0x%02x):", status, S2MM_STATUS_REGISTER);
-
-    if (status & STATUS_HALTED) {
-        printf(" Halted.\n");
-    } else {
-        printf(" Running.\n");
-    }
-
-    if (status & STATUS_IDLE) {
-        printf(" Idle.\n");
-    }
-
-    if (status & STATUS_SG_INCLDED) {
-        printf(" SG is included.\n");
-    }
-
-    if (status & STATUS_DMA_INTERNAL_ERR) {
-        printf(" DMA internal error.\n");
-    }
-
-    if (status & STATUS_DMA_SLAVE_ERR) {
-        printf(" DMA slave error.\n");
-    }
-
-    if (status & STATUS_DMA_DECODE_ERR) {
-        printf(" DMA decode error.\n");
-    }
-
-    if (status & STATUS_SG_INTERNAL_ERR) {
-        printf(" SG internal error.\n");
-    }
-
-    if (status & STATUS_SG_SLAVE_ERR) {
-        printf(" SG slave error.\n");
-    }
-
-    if (status & STATUS_SG_DECODE_ERR) {
-        printf(" SG decode error.\n");
-    }
-
-    if (status & STATUS_IOC_IRQ) {
-        printf(" IOC interrupt occurred.\n");
-    }
-
-    if (status & STATUS_DELAY_IRQ) {
-        printf(" Interrupt on delay occurred.\n");
-    }
-
-    if (status & STATUS_ERR_IRQ) {
-        printf(" Error interrupt occurred.\n");
+    uint32_t x = seed ? seed : 0x12345678;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;  // xorshift32
+        p[i] = (uint8_t)x;
     }
 }
 
-void dma_mm2s_status(unsigned int *virtual_addr)
+int main(int argc, char **argv)
 {
-    unsigned int status = read_dma(virtual_addr, MM2S_STATUS_REGISTER);
+    const char *name = DEFAULT_UDMABUF;
+    size_t n = DEFAULT_BYTES;
+    uint32_t seed = 0xdeadbeef;
+    int cached = 1, opt;
 
-    printf("Memory-mapped to stream status (0x%08x@0x%02x):", status, MM2S_STATUS_REGISTER);
-
-    if (status & STATUS_HALTED) {
-        printf(" Halted.\n");
-    } else {
-        printf(" Running.\n");
-    }
-
-    if (status & STATUS_IDLE) {
-        printf(" Idle.\n");
-    }
-
-    if (status & STATUS_SG_INCLDED) {
-        printf(" SG is included.\n");
-    }
-
-    if (status & STATUS_DMA_INTERNAL_ERR) {
-        printf(" DMA internal error.\n");
-    }
-
-    if (status & STATUS_DMA_SLAVE_ERR) {
-        printf(" DMA slave error.\n");
-    }
-
-    if (status & STATUS_DMA_DECODE_ERR) {
-        printf(" DMA decode error.\n");
-    }
-
-    if (status & STATUS_SG_INTERNAL_ERR) {
-        printf(" SG internal error.\n");
-    }
-
-    if (status & STATUS_SG_SLAVE_ERR) {
-        printf(" SG slave error.\n");
-    }
-
-    if (status & STATUS_SG_DECODE_ERR) {
-        printf(" SG decode error.\n");
-    }
-
-    if (status & STATUS_IOC_IRQ) {
-        printf(" IOC interrupt occurred.\n");
-    }
-
-    if (status & STATUS_DELAY_IRQ) {
-        printf(" Interrupt on delay occurred.\n");
-    }
-
-    if (status & STATUS_ERR_IRQ) {
-        printf(" Error interrupt occurred.\n");
-    }
-}
-
-int dma_mm2s_sync(unsigned int *virtual_addr)
-{
-    unsigned int mm2s_status =  read_dma(virtual_addr, MM2S_STATUS_REGISTER);
-
-    // sit in this while loop as long as the status does not read back 0x00001002 (4098)
-    // 0x00001002 = IOC interrupt has occured and DMA is idle
-    while(!(mm2s_status & IOC_IRQ_FLAG) || !(mm2s_status & IDLE_FLAG))
-    {
-        dma_s2mm_status(virtual_addr);
-        dma_mm2s_status(virtual_addr);
-
-        mm2s_status =  read_dma(virtual_addr, MM2S_STATUS_REGISTER);
-        usleep(100000);
-    }
-
-    return 0;
-}
-
-int dma_s2mm_sync(unsigned int *virtual_addr)
-{
-    unsigned int s2mm_status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-
-    // sit in this while loop as long as the status does not read back 0x00001002 (4098)
-    // 0x00001002 = IOC interrupt has occured and DMA is idle
-    while(!(s2mm_status & IOC_IRQ_FLAG) || !(s2mm_status & IDLE_FLAG))
-    {
-        dma_s2mm_status(virtual_addr);
-        dma_mm2s_status(virtual_addr);
-
-        s2mm_status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-        usleep(100000);
-    }
-
-    return 0;
-}
-
-void print_mem(void *virtual_address, int byte_count)
-{
-    char *data_ptr = virtual_address;
-
-    for(int i=0;i<byte_count;i++){
-        printf("%02X", data_ptr[i]);
-
-        // print a space every 4 bytes (0 indexed)
-        if(i%4==3){
-            printf(" ");
+    while ((opt = getopt(argc, argv, "d:n:s:uh")) != -1) {
+        switch (opt) {
+        case 'd': name = optarg; break;
+        case 'n': n = strtoull(optarg, NULL, 0); break;
+        case 's': seed = (uint32_t)strtoul(optarg, NULL, 0); break;
+        case 'u': cached = 0; break;
+        default:  usage(argv[0]); return opt == 'h' ? 0 : 2;
         }
     }
 
-    printf("\n");
-}
+    axi_dma_t dma;
+    udmabuf_t ub;
+    int ret = 1;
 
-int main()
-{
-    printf("Hello World! - Running DMA transfer test application.\n");
+    if (udmabuf_open(&ub, name, cached) < 0)
+        return 1;
+    printf("u-dma-buf %s: phys 0x%lx, 0x%zx bytes, %s\n", ub.name, ub.phys_addr,
+           ub.size, ub.coherent ? "coherent" : ub.cached ? "cached" : "uncached");
 
-    printf("Opening a character device file of the Arty's DDR memeory...\n");
-    int ddr_memory = open("/dev/mem", O_RDWR | O_SYNC);
+    size_t dst_off = (n + 0xfff) & ~(size_t)0xfff;
+    if (n == 0 || dst_off + n > ub.size) {
+        fprintf(stderr, "-n 0x%zx does not fit twice in the buffer\n", n);
+        goto out_buf;
+    }
+    if (axi_dma_open(&dma, DMA_BASE, AXI_DMA_LENGTH_WIDTH) < 0)
+        goto out_buf;
+    if (n > dma.max_length) {
+        fprintf(stderr, "-n 0x%zx above the DMA's 0x%x max length\n", n, dma.max_length);
+        goto out_dma;
+    }
 
-    printf("Memory map the address of the DMA AXI IP via its AXI lite control interface register block.\n");
-    unsigned int *dma_virtual_addr = mmap(NULL, 0xFFFF, PROT_READ | PROT_WRITE, MAP_SHARED, ddr_memory, DMA_BASE);
+    uint8_t *src = ub.buf, *dst = (uint8_t *)ub.buf + dst_off;
+    fill_pattern(src, n, seed);
+    memset(dst, 0, n);
+    if (udmabuf_sync_for_device(&ub, 0, n, UDMABUF_TO_DEVICE) < 0 ||
+        udmabuf_sync_for_device(&ub, dst_off, n, UDMABUF_FROM_DEVICE) < 0)
+        goto out_dma;
 
-    printf("Memory map the MM2S source address register block.\n");
-    unsigned int *virtual_src_addr  = mmap(NULL, 0xFFFF, PROT_READ | PROT_WRITE, MAP_SHARED, ddr_memory, MM2S_BASE);
+    if (axi_dma_reset(&dma) < 0 ||
+        axi_dma_start(&dma, AXI_DMA_S2MM, 0) < 0 ||
+        axi_dma_start(&dma, AXI_DMA_MM2S, 0) < 0)
+        goto out_dma;
 
-    printf("Memory map the S2MM destination address register block.\n");
-    unsigned int *virtual_dst_addr = mmap(NULL, 0xFFFF, PROT_READ | PROT_WRITE, MAP_SHARED, ddr_memory, S2MM_BASE);
+    /* Destination first, so S2MM is ready when the data comes around */
+    double t0 = axi_now();
+    axi_dma_arm(&dma, AXI_DMA_S2MM, ub.phys_addr + dst_off, (uint32_t)n);
+    axi_dma_arm(&dma, AXI_DMA_MM2S, ub.phys_addr, (uint32_t)n);
 
-    printf("Writing random data to source register block...\n");
-    virtual_src_addr[0]= 0xEFBEADDE;
-    virtual_src_addr[1]= 0x11223344;
-    virtual_src_addr[2]= 0xABABABAB;
-    virtual_src_addr[3]= 0xCDCDCDCD;
-    virtual_src_addr[4]= 0x00001111;
-    virtual_src_addr[5]= 0x22223333;
-    virtual_src_addr[6]= 0x44445555;
-    virtual_src_addr[7]= 0x66667777;
+    int r = axi_dma_wait(&dma, AXI_DMA_MM2S, WAIT_TIMEOUT_S);
+    if (r == AXI_DMA_OK)
+        r = axi_dma_wait(&dma, AXI_DMA_S2MM, WAIT_TIMEOUT_S);
+    double dt = axi_now() - t0;
+    if (r != AXI_DMA_OK) {
+        if (r == AXI_DMA_TIMEOUT)
+            fprintf(stderr, "Transfer timed out\n");
+        axi_dma_print_status(stderr, AXI_DMA_MM2S, axi_dma_status(&dma, AXI_DMA_MM2S));
+        axi_dma_print_status(stderr, AXI_DMA_S2MM, axi_dma_status(&dma, AXI_DMA_S2MM));
+        goto out_dma;
+    }
 
-    printf("Clearing the destination register block...\n");
-    memset(virtual_dst_addr, 0, 32);
+    uint32_t got = axi_dma_s2mm_bytes(&dma);
+    if (udmabuf_sync_for_cpu(&ub, dst_off, n, UDMABUF_FROM_DEVICE) < 0)
+        goto out_dma;
 
-    printf("Source memory block data:      ");
-    print_mem(virtual_src_addr, 32);
+    size_t show = n < 32 ? n : 32;
+    hexdump("Source:", src, show);
+    hexdump("Destination:", dst, show);
+    printf("Looped back 0x%x of 0x%zx bytes in %.1f us\n", got, n, dt * 1e6);
 
-    printf("Destination memory block data: ");
-    print_mem(virtual_dst_addr, 32);
+    size_t bad = 0, first = 0;
+    for (size_t i = 0; i < n; i++)
+        if (src[i] != dst[i] && bad++ == 0)
+            first = i;
+    if (bad)
+        printf("%zu byte(s) differ, first at 0x%zx: 0x%02x != 0x%02x\n",
+               bad, first, dst[first], src[first]);
 
-    printf("Reset the DMA.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, RESET_DMA);
-    write_dma(dma_virtual_addr, MM2S_CONTROL_REGISTER, RESET_DMA);
-    dma_s2mm_status(dma_virtual_addr);
-    dma_mm2s_status(dma_virtual_addr);
+    ret = (got == n && bad == 0) ? 0 : 1;
+    printf("%s\n", ret == 0 ? "PASS" : "FAIL");
 
-    printf("Halt the DMA.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, HALT_DMA);
-    write_dma(dma_virtual_addr, MM2S_CONTROL_REGISTER, HALT_DMA);
-    dma_s2mm_status(dma_virtual_addr);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Enable all interrupts.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, ENABLE_ALL_IRQ);
-    write_dma(dma_virtual_addr, MM2S_CONTROL_REGISTER, ENABLE_ALL_IRQ);
-    dma_s2mm_status(dma_virtual_addr);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Writing source address of the data from MM2S in DDR...\n");
-    write_dma(dma_virtual_addr, MM2S_SRC_ADDRESS_REGISTER, MM2S_BASE);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Writing the destination address for the data from S2MM in DDR...\n");
-    write_dma(dma_virtual_addr, S2MM_DST_ADDRESS_REGISTER, S2MM_BASE);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Run the MM2S channel.\n");
-    write_dma(dma_virtual_addr, MM2S_CONTROL_REGISTER, RUN_DMA);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Run the S2MM channel.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, RUN_DMA);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Writing MM2S transfer length of 32 bytes...\n");
-    write_dma(dma_virtual_addr, MM2S_TRNSFR_LENGTH_REGISTER, 32);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Writing S2MM transfer length of 32 bytes...\n");
-    write_dma(dma_virtual_addr, S2MM_BUFF_LENGTH_REGISTER, 32);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Waiting for MM2S synchronization...\n");
-    dma_mm2s_sync(dma_virtual_addr);
-
-    printf("Waiting for S2MM sychronization...\n");
-    dma_s2mm_sync(dma_virtual_addr);
-
-    dma_s2mm_status(dma_virtual_addr);
-    dma_mm2s_status(dma_virtual_addr);
-
-    printf("Destination memory block: ");
-    print_mem(virtual_dst_addr, 32);
-
-    printf("\n");
-
-    return 0;
+out_dma:
+    axi_dma_close(&dma);
+out_buf:
+    udmabuf_close(&ub);
+    return ret;
 }

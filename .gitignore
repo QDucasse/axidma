@@ -58,3 +58,10 @@
 
 # Local scripts or test artifacts
 /local/
+
+# Software build outputs
+/src/**/*.o
+/src/lib/*.a
+/src/s2mm_test
+/src/dma_test
+/src/dma_dump

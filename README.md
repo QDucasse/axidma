@@ -59,7 +59,7 @@ You can then either load the module at run time using `insmod` or embed it in yo
 petalinux-create modules --name u-dma-buf --enable --force
 ```
 
-And replace the `files/u-dma-buf.c` with the one in the repository!
+And replace its `files/u-dma-buf.c` with `udmabuf/u-dma-buf.c` from the [udmabuf](https://github.com/ikwzm/udmabuf) submodule.
 
 
 You can then build the project:
@@ -97,52 +97,38 @@ cp axidma.bin /lib/firmware/axidma.bin
 fpgautil -b /lib/firmware/axidma.bin -o /lib/firmware/pl.dtbo
 ```
 
-You can then run the test program found in `src/dma_test.c`, taken from [this tutorial](https://www.hackster.io/whitney-knitter/introduction-to-using-axi-dma-in-embedded-linux-5264ec), or the adapted version `src/s2mm_test.c`:
+### Software
 
+`src/lib/` is a small user-space library for the AXI DMA in simple (direct register) mode:
+
+- `axi_regs`: maps an AXI-Lite register block through `/dev/mem`. It uses the same API as fuzzsight/decode-sight.
+- `udmabuf`: finds a u-dma-buf device's physical address and size in sysfs, maps it cached or uncached, and does the cache maintenance (`sync_for_cpu`/`sync_for_device`) that a cached mapping needs.
+- `axi_dma`: resets the core, starts/stops a channel, arms a transfer, and waits for completion with a timeout and decoded error bits. It also reads back the bytes S2MM actually wrote and drains stale stream data.
+
+Three examples are built on it:
+
+| Program | Design | What it does |
+|---|---|---|
+| `s2mm_test` | `s2mm_async_ila` | Captures the pattern generator's counter through S2MM, one transfer per TLAST-terminated packet, and checks the counter for gaps. It waits for Enter so the ILA can be armed (`-y` skips this). |
+| `dma_test` | `axidma` | Loops a pseudo-random buffer MM2S → FIFO → S2MM and compares the two copies. |
+| `dma_dump` | any | Dumps (part of) the u-dma-buf to a file. |
+
+Build them on the board, or cross-compile:
 ```bash
-root@xilinx-zcu104:/home/root# gcc -O2 -o dma_test dma_test.c
-root@xilinx-zcu104:/home/root# ./dma_test
-Hello World! - Running DMA transfer test application.
-Opening a character device file of the Arty's DDR memeory...
-Memory map the address of the DMA AXI IP via its AXI lite control interface register block.
-Memory map the MM2S source address register block.
-Memory map the S2MM destination address register block.
-Writing random data to source register block...
-Clearing the destination register block...
-Source memory block data:      DEADBEEF 44332211 ABABABAB CDCDCDCD 11110000 33332222 55554444 77776666
-Destination memory block data: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
-Reset the DMA.
-Stream to memory-mapped status (0x00000001@0x34): Halted.
-Memory-mapped to stream status (0x00000001@0x04): Halted.
-Halt the DMA.
-Stream to memory-mapped status (0x00000001@0x34): Halted.
-Memory-mapped to stream status (0x00000001@0x04): Halted.
-Enable all interrupts.
-Stream to memory-mapped status (0x00000001@0x34): Halted.
-Memory-mapped to stream status (0x00000001@0x04): Halted.
-Writing source address of the data from MM2S in DDR...
-Memory-mapped to stream status (0x00000001@0x04): Halted.
-Writing the destination address for the data from S2MM in DDR...
-Stream to memory-mapped status (0x00000001@0x34): Halted.
-Run the MM2S channel.
-Memory-mapped to stream status (0x00000000@0x04): Running.
-Run the S2MM channel.
-Stream to memory-mapped status (0x00000000@0x34): Running.
-Writing MM2S transfer length of 32 bytes...
-Memory-mapped to stream status (0x00000000@0x04): Running.
-Writing S2MM transfer length of 32 bytes...
-Stream to memory-mapped status (0x00000000@0x34): Running.
-Waiting for MM2S synchronization...
-Waiting for S2MM sychronization...
-Stream to memory-mapped status (0x00001002@0x34): Running.
- Idle.
- IOC interrupt occurred.
-Memory-mapped to stream status (0x00001002@0x04): Running.
- Idle.
- IOC interrupt occurred.
-Destination memory block: DEADBEEF 44332211 ABABABAB CDCDCDCD 11110000 33332222 55554444 77776666
+cd src
+make                                     # on the board
+make CROSS_COMPILE=aarch64-linux-gnu-    # from a host
+make CPPFLAGS='-DDMA_BASE=0xA0000000'    # if the block design addresses differ
 ```
 
+```bash
+root@xilinx-zcu104:~# ./dma_test -n 0x10000
+root@xilinx-zcu104:~# ./s2mm_test -n 0x4000 -o capture.bin
+```
+
+The buffer is mapped cached by default and synced around each DMA. Pass `-u` to map it uncached (`O_SYNC`) instead. Both programs exit 0 on PASS.
+
+Leave the DMA to these programs: if the `pl.dtsi` binds the `axi_dma` node to the kernel's `xilinx_dma` driver, that driver may reset the core or acknowledge its status bits while these programs are polling.
 
 #### Notes:
 
@@ -160,9 +146,4 @@ The experiment was run on a ZynqMP UltraScale+ ZCU104, using Vivado 2024.2 and p
     set board_dts "zcu104-revc"
     ```
 
-- and the address of your `axi_dma` device from the device tree that is then used in the test script:
-    ```c
-    #define DMA_BASE  0x80000000 // Address of the DMA registers
-    #define MM2S_BASE 0x68000000 // Address of the DMA buffer
-    #define S2MM_BASE 0x68010000 // Still falls in the DMA buffer!
-    ```
+- and the addresses from your block design, which the programs take as compile-time defines (`DMA_BASE`, default `0x80000000`; `GPIO_BASE`, default `0x80010000`). The buffer address no longer needs to be set: it is read from `/sys/class/u-dma-buf/<name>/phys_addr`.

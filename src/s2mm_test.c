@@ -1,278 +1,198 @@
-/*
-* Copyright (C) 2013 - 2016  Xilinx, Inc.  All rights reserved.
-*
-* Permission is hereby granted, free of charge, to any person
-* obtaining a copy of this software and associated documentation
-* files (the "Software"), to deal in the Software without restriction,
-* including without limitation the rights to use, copy, modify, merge,
-* publish, distribute, sublicense, and/or sell copies of the Software,
-* and to permit persons to whom the Software is furnished to do so,
-* subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included
-* in all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-* IN NO EVENT SHALL XILINX  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-* CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*
-* Except as contained in this notice, the name of the Xilinx shall not be used
-* in advertising or otherwise to promote the sale, use or other dealings in this
-* Software without prior written authorization from Xilinx.
-*
-*/
+// s2mm_test.c
+// S2MM-only capture for the s2mm_async_ila design: axi_pattern_gen -> async
+// AXIS FIFO -> AXI DMA S2MM -> u-dma-buf. The generator emits a 32-bit
+// counter with TLAST every FRAME_BYTES (32), so each S2MM transfer stops at
+// a packet boundary and is re-armed at the next free byte of the buffer.
+// Because the data is a counter, the capture is checked for continuity: a
+// gap means data was lost or written to the wrong place.
+//
+// Note: the generator latches its start input, so clearing the GPIO at the
+// end does not stop it; only a PL reset does. A second run therefore starts
+// from wherever the counter is, which the continuity check tolerates.
 
-
-/*
-* This test file sets up the S2MM channel and waits for the CoreSight trace.
-*
-*/
-
-
+#include <getopt.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
-#include <termios.h>
-#include <sys/mman.h>
 
-#define DMA_BASE  0x80000000
-#define DMA_SIZE  0x10000
-#define S2MM_BASE 0x68000000
-#define S2MM_SIZE 0x04000000
-#define GPIO_BASE 0x80010000
-#define GPIO_SIZE 0x10000   // 64 KB AXI GPIO range
+#include "lib/axi_dma.h"
+#include "lib/axi_regs.h"
+#include "lib/udmabuf.h"
 
-#define S2MM_CONTROL_REGISTER       0x30
-#define S2MM_STATUS_REGISTER        0x34
-#define S2MM_DST_ADDRESS_REGISTER   0x48
-#define S2MM_BUFF_LENGTH_REGISTER   0x58
+#ifndef DMA_BASE
+#define DMA_BASE        0x80000000
+#endif
+#ifndef GPIO_BASE
+#define GPIO_BASE       0x80010000
+#endif
+#define GPIO_MAP_SIZE   0x10000
+#define GPIO_DATA       0x00
+#define GPIO_TRI        0x04
 
-#define IOC_IRQ_FLAG                1<<12
-#define IDLE_FLAG                   1<<1
+#define DEFAULT_UDMABUF "udmabuf0"
+#define DEFAULT_BYTES   0x4000
+#define WAIT_TIMEOUT_S  1.0
 
-#define STATUS_HALTED               0x00000001
-#define STATUS_IDLE                 0x00000002
-#define STATUS_SG_INCLDED           0x00000008
-#define STATUS_DMA_INTERNAL_ERR     0x00000010
-#define STATUS_DMA_SLAVE_ERR        0x00000020
-#define STATUS_DMA_DECODE_ERR       0x00000040
-#define STATUS_SG_INTERNAL_ERR      0x00000100
-#define STATUS_SG_SLAVE_ERR         0x00000200
-#define STATUS_SG_DECODE_ERR        0x00000400
-#define STATUS_IOC_IRQ              0x00001000
-#define STATUS_DELAY_IRQ            0x00002000
-#define STATUS_ERR_IRQ              0x00004000
-
-#define HALT_DMA                    0x00000000
-#define RUN_DMA                     0x00000001
-#define RESET_DMA                   0x00000004
-#define ENABLE_IOC_IRQ              0x00001000
-#define ENABLE_DELAY_IRQ            0x00002000
-#define ENABLE_ERR_IRQ              0x00004000
-#define ENABLE_ALL_IRQ              0x00007000
-
-#define CHUNK_SIZE                 32 // Must match AXI-DMA value
-#define TRANSFER_SIZE              0x000004000
-
-unsigned int write_dma(unsigned int *virtual_addr, int offset, unsigned int value)
+static void usage(const char *prog)
 {
-    virtual_addr[offset>>2] = value;
-
-    return 0;
+    fprintf(stderr,
+        "usage: %s [-d udmabuf] [-n bytes] [-o dump.bin] [-u] [-y] [-v]\n"
+        "  -d  u-dma-buf device (default " DEFAULT_UDMABUF ")\n"
+        "  -n  bytes to capture (default 0x%x)\n"
+        "  -o  write the capture to a file\n"
+        "  -u  map the buffer uncached instead of cached + sync\n"
+        "  -y  do not wait for Enter before starting the generator\n"
+        "  -v  print every transfer\n", prog, DEFAULT_BYTES);
 }
 
-unsigned int read_dma(unsigned int *virtual_addr, int offset)
+static void hexdump(const void *p, size_t n)
 {
-    return virtual_addr[offset>>2];
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++)
+        printf("%02x%s", b[i], (i % 16 == 15) ? "\n" : (i % 4 == 3) ? " " : "");
+    if (n % 16) putchar('\n');
 }
 
-void dma_s2mm_status(unsigned int *virtual_addr)
+/* Count breaks in the +1 sequence, print the first few */
+static size_t check_counter(const uint32_t *w, size_t nwords)
 {
-    unsigned int status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-
-    printf("Stream to memory-mapped status (0x%08x@0x%02x):", status, S2MM_STATUS_REGISTER);
-
-    if (status & STATUS_HALTED) {
-        printf(" Halted.\n");
-    } else {
-        printf(" Running.\n");
-    }
-
-    if (status & STATUS_IDLE) {
-        printf(" Idle.\n");
-    }
-
-    if (status & STATUS_SG_INCLDED) {
-        printf(" SG is included.\n");
-    }
-
-    if (status & STATUS_DMA_INTERNAL_ERR) {
-        printf(" DMA internal error.\n");
-    }
-
-    if (status & STATUS_DMA_SLAVE_ERR) {
-        printf(" DMA slave error.\n");
-    }
-
-    if (status & STATUS_DMA_DECODE_ERR) {
-        printf(" DMA decode error.\n");
-    }
-
-    if (status & STATUS_SG_INTERNAL_ERR) {
-        printf(" SG internal error.\n");
-    }
-
-    if (status & STATUS_SG_SLAVE_ERR) {
-        printf(" SG slave error.\n");
-    }
-
-    if (status & STATUS_SG_DECODE_ERR) {
-        printf(" SG decode error.\n");
-    }
-
-    if (status & STATUS_IOC_IRQ) {
-        printf(" IOC interrupt occurred.\n");
-    }
-
-    if (status & STATUS_DELAY_IRQ) {
-        printf(" Interrupt on delay occurred.\n");
-    }
-
-    if (status & STATUS_ERR_IRQ) {
-        printf(" Error interrupt occurred.\n");
-    }
-}
-
-int dma_s2mm_sync(unsigned int *virtual_addr)
-{
-    unsigned int s2mm_status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-
-    // sit in this while loop as long as the status does not read back 0x00001002 (4098)
-    // 0x00001002 = IOC interrupt has occured and DMA is idle
-    while(!(s2mm_status & IOC_IRQ_FLAG) || !(s2mm_status & IDLE_FLAG))
-    {
-        dma_s2mm_status(virtual_addr);
-        // dma_mm2s_status(virtual_addr);
-
-        s2mm_status = read_dma(virtual_addr, S2MM_STATUS_REGISTER);
-    }
-
-    return 0;
-}
-
-void print_mem(void *virtual_address, int byte_count)
-{
-    char *data_ptr = virtual_address;
-
-    for(int i=0;i<byte_count;i++){
-        printf("%02X", data_ptr[i]);
-
-        // print a space every 4 bytes (0 indexed)
-        if(i%4==3){
-            printf(" ");
+    size_t gaps = 0;
+    for (size_t i = 1; i < nwords; i++) {
+        if (w[i] != w[i - 1] + 1) {
+            if (gaps < 8)
+                printf("  gap at byte 0x%zx: 0x%08x -> 0x%08x\n",
+                       i * 4, w[i - 1], w[i]);
+            gaps++;
         }
     }
-
-    printf("\n");
+    return gaps;
 }
 
-int main()
+static int dump_to_file(const char *path, const void *buf, size_t n)
 {
-    printf("Hello World! - Running S2MM Async test application.\n");
-
-    printf("Opening a character device file of the ZynqMP's DDR memory...\n");
-    int ddr_memory = open("/dev/mem", O_RDWR | O_SYNC);
-
-    printf("Memory map the address of the DMA AXI IP via its AXI lite control interface register block.\n");
-    unsigned int *dma_virtual_addr = mmap(NULL, DMA_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ddr_memory, DMA_BASE);
-
-
-    printf("Opening u-dma-buf character device for S2MM destination...\n");
-    int dma_buf_fd = open("/dev/udmabuf0", O_RDWR); // use the device name exported by u-dma-buf
-    if(dma_buf_fd < 0) {
-        perror("Failed to open u-dma-buf device");
-        return -1;
-    }
-
-    unsigned int *virtual_dst_addr = mmap(NULL, S2MM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dma_buf_fd, 0);
-    if(virtual_dst_addr == MAP_FAILED) {
-        perror("Failed to mmap u-dma-buf memory");
-        return -1;
-    }
-
-     // Map AXI GPIO
-    unsigned int *gpio = mmap(NULL, GPIO_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ddr_memory, GPIO_BASE);
-    if(gpio == MAP_FAILED) { perror("Failed to mmap GPIO"); return -1; }
-
-    // Clearing buffer via the u-dma-buf mapping
-    memset(virtual_dst_addr, 0, S2MM_SIZE);
-    printf("Destination memory block data (first 8 bytes): ");
-    print_mem(virtual_dst_addr, 32);
-
-    printf("Reset the DMA.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, RESET_DMA);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Halt the DMA.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, HALT_DMA);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Enable all interrupts.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, ENABLE_ALL_IRQ);
-    unsigned int control = read_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER);
-    printf("Stream to memory-mapped control (0x%08x@0x%02x)...\n", control, S2MM_CONTROL_REGISTER);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Writing the destination address for the data from S2MM in DDR: 0x%x\n", S2MM_BASE);
-    write_dma(dma_virtual_addr, S2MM_DST_ADDRESS_REGISTER, S2MM_BASE);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Start running.\n");
-    write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, RUN_DMA);
-    control = read_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER);
-    printf("Stream to memory-mapped control (0x%08x@0x%02x)...\n", control, S2MM_CONTROL_REGISTER);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Writing S2MM chunk size of 0x%x bytes...\n", CHUNK_SIZE);
-    write_dma(dma_virtual_addr, S2MM_BUFF_LENGTH_REGISTER, CHUNK_SIZE);
-    dma_s2mm_status(dma_virtual_addr);
-
-    printf("Launching generator.\n");
-    gpio[0] = 1;   // Pattern generator
-
-    unsigned int offset = 0;
-    unsigned int dst_addr = S2MM_BASE;
-
-    while(offset <= 0x000004000) {
-
-        printf("Waiting for chunk transfer...\n");
-        dma_s2mm_sync(dma_virtual_addr);
-
-
-        // Move to next chunk (wrap around at 64 MB)
-        offset += CHUNK_SIZE;
-        if (offset >= S2MM_SIZE) offset = 0;
-        dst_addr = S2MM_BASE + offset;
-
-        printf("Rewriting destination address (0x%x) and chunk size.\n", dst_addr);
-        write_dma(dma_virtual_addr, S2MM_DST_ADDRESS_REGISTER, dst_addr);
-        write_dma(dma_virtual_addr, S2MM_BUFF_LENGTH_REGISTER, CHUNK_SIZE);
-        dma_s2mm_status(dma_virtual_addr);
-
-
-        printf("Restarting DMA...\n");
-        write_dma(dma_virtual_addr, S2MM_CONTROL_REGISTER, RUN_DMA | ENABLE_ALL_IRQ);
-
-    }
-
-    printf("Wrote 0x%x bytes.\n", offset);
-
-    print_mem(virtual_dst_addr, TRANSFER_SIZE);
-    dma_s2mm_status(dma_virtual_addr);
-
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return -1; }
+    size_t w = fwrite(buf, 1, n, f);
+    if (fclose(f) != 0 || w != n) { perror(path); return -1; }
+    printf("Wrote 0x%zx bytes to %s\n", n, path);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    const char *name = DEFAULT_UDMABUF, *out = NULL;
+    size_t want = DEFAULT_BYTES;
+    int cached = 1, wait_enter = 1, verbose = 0, opt;
+
+    while ((opt = getopt(argc, argv, "d:n:o:uyvh")) != -1) {
+        switch (opt) {
+        case 'd': name = optarg; break;
+        case 'n': want = strtoull(optarg, NULL, 0); break;
+        case 'o': out = optarg; break;
+        case 'u': cached = 0; break;
+        case 'y': wait_enter = 0; break;
+        case 'v': verbose = 1; break;
+        default:  usage(argv[0]); return opt == 'h' ? 0 : 2;
+        }
+    }
+    if (want == 0 || want % 4) {
+        fprintf(stderr, "-n must be a non-zero multiple of 4\n");
+        return 2;
+    }
+
+    axi_dma_t dma;
+    axi_regs_t gpio;
+    udmabuf_t ub;
+    int ret = 1;
+
+    if (udmabuf_open(&ub, name, cached) < 0)
+        return 1;
+    if (want > ub.size) {
+        fprintf(stderr, "%s holds 0x%zx bytes, asked for 0x%zx\n", ub.name, ub.size, want);
+        udmabuf_close(&ub);
+        return 1;
+    }
+    printf("u-dma-buf %s: phys 0x%lx, 0x%zx bytes, %s\n", ub.name, ub.phys_addr,
+           ub.size, ub.coherent ? "coherent" : ub.cached ? "cached" : "uncached");
+
+    if (axi_dma_open(&dma, DMA_BASE, AXI_DMA_LENGTH_WIDTH) < 0)
+        goto out_buf;
+    if (axi_regs_open(&gpio, GPIO_BASE, GPIO_MAP_SIZE) < 0)
+        goto out_dma;
+
+    /* Clear the destination, then push the zeros out of the cache so no
+     * dirty line lands on top of the DMA data later */
+    memset(ub.buf, 0, want);
+    if (udmabuf_sync_for_device(&ub, 0, want, UDMABUF_FROM_DEVICE) < 0)
+        goto out_gpio;
+
+    if (axi_dma_reset(&dma) < 0 || axi_dma_start(&dma, AXI_DMA_S2MM, 0) < 0)
+        goto out_gpio;
+    axi_dma_print_status(stdout, AXI_DMA_S2MM, axi_dma_status(&dma, AXI_DMA_S2MM));
+
+    if (wait_enter) {
+        printf("Arm the ILA, then press Enter to start the generator...");
+        fflush(stdout);
+        getchar();
+    }
+    axi_regs_write(&gpio, GPIO_TRI, 0);   // channel 1 as output
+    axi_regs_write(&gpio, GPIO_DATA, 1);  // start the pattern generator
+
+    size_t off = 0, transfers = 0;
+    double t0 = axi_now();
+    while (off < want) {
+        uint32_t armed = axi_dma_arm(&dma, AXI_DMA_S2MM, ub.phys_addr + off,
+                                     (uint32_t)(want - off < dma.max_length ?
+                                                want - off : dma.max_length));
+        int r = axi_dma_wait(&dma, AXI_DMA_S2MM, WAIT_TIMEOUT_S);
+        if (r == AXI_DMA_TIMEOUT) {
+            fprintf(stderr, "No data after %.1f s at byte 0x%zx (bitstream "
+                    "loaded? generator running?)\n", WAIT_TIMEOUT_S, off);
+            axi_dma_print_status(stderr, AXI_DMA_S2MM,
+                                 axi_dma_status(&dma, AXI_DMA_S2MM));
+            break;
+        }
+        if (r != AXI_DMA_OK)
+            break;
+        uint32_t got = axi_dma_s2mm_bytes(&dma);
+        if (verbose)
+            printf("  transfer %zu: 0x%x/0x%x bytes at 0x%zx\n",
+                   transfers, got, armed, off);
+        if (got == 0 || got > armed) {
+            fprintf(stderr, "S2MM reported 0x%x bytes for a 0x%x transfer\n", got, armed);
+            break;
+        }
+        off += got;
+        transfers++;
+    }
+    double dt = axi_now() - t0;
+
+    axi_regs_write(&gpio, GPIO_DATA, 0);  // see the note at the top
+
+    if (udmabuf_sync_for_cpu(&ub, 0, off, UDMABUF_FROM_DEVICE) < 0)
+        goto out_gpio;
+
+    printf("Captured 0x%zx bytes in %zu transfers, %.3f ms (%.1f MB/s)\n",
+           off, transfers, dt * 1e3, dt > 0 ? (double)off / dt / 1e6 : 0.0);
+    printf("First bytes:\n");
+    hexdump(ub.buf, off < 64 ? off : 64);
+
+    size_t gaps = check_counter(ub.buf, off / 4);
+    if (off >= 4)
+        printf("Counter 0x%08x .. 0x%08x, %zu gap(s)\n", ((uint32_t *)ub.buf)[0],
+               ((uint32_t *)ub.buf)[off / 4 - 1], gaps);
+
+    if (out && dump_to_file(out, ub.buf, off) < 0)
+        goto out_gpio;
+
+    ret = (off == want && gaps == 0) ? 0 : 1;
+    printf("%s\n", ret == 0 ? "PASS" : "FAIL");
+
+out_gpio:
+    axi_regs_close(&gpio);
+out_dma:
+    axi_dma_close(&dma);
+out_buf:
+    udmabuf_close(&ub);
+    return ret;
 }

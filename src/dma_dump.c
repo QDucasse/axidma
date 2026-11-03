@@ -1,27 +1,65 @@
+// dma_dump.c
+// Dump (part of) a u-dma-buf to a file, e.g. after s2mm_test.
+
+#include <getopt.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include <stdlib.h>
 
-#define BUF_SIZE 0x04000000
+#include "lib/udmabuf.h"
 
-int main() {
-    int fd = open("/dev/udmabuf0", O_RDONLY);
-    if(fd < 0) { perror("open"); return -1; }
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s [-d udmabuf] [-s offset] [-n bytes] [-o file]\n"
+        "  defaults: udmabuf0, the whole buffer, dma_dump.bin\n", prog);
+}
 
-    void *buf = mmap(NULL, BUF_SIZE, PROT_READ, MAP_SHARED, fd, 0);
-    if(buf == MAP_FAILED) { perror("mmap"); return -1; }
+int main(int argc, char **argv)
+{
+    const char *name = "udmabuf0", *out = "dma_dump.bin";
+    size_t off = 0, n = 0;
+    int opt;
 
-    int out = open("dma_dump.bin", O_CREAT | O_WRONLY, 0666);
-    if(out < 0) { perror("open output"); return -1; }
+    while ((opt = getopt(argc, argv, "d:s:n:o:h")) != -1) {
+        switch (opt) {
+        case 'd': name = optarg; break;
+        case 's': off = strtoull(optarg, NULL, 0); break;
+        case 'n': n = strtoull(optarg, NULL, 0); break;
+        case 'o': out = optarg; break;
+        default:  usage(argv[0]); return opt == 'h' ? 0 : 2;
+        }
+    }
 
-    ssize_t written = write(out, buf, BUF_SIZE);
-    if(written != BUF_SIZE) { perror("write"); }
+    udmabuf_t ub;
+    if (udmabuf_open(&ub, name, 1) < 0)
+        return 1;
+    if (off > ub.size) {
+        fprintf(stderr, "offset 0x%zx past the 0x%zx buffer\n", off, ub.size);
+        udmabuf_close(&ub);
+        return 1;
+    }
+    if (n == 0 || n > ub.size - off)
+        n = ub.size - off;
 
-    munmap(buf, BUF_SIZE);
-    close(fd);
-    close(out);
+    /* Whatever a DMA wrote must not be shadowed by stale cache lines */
+    if (udmabuf_sync_for_cpu(&ub, off, n, UDMABUF_FROM_DEVICE) < 0) {
+        udmabuf_close(&ub);
+        return 1;
+    }
 
-    printf("DMA buffer dumped to dma_dump.bin\n");
-    return 0;
+    int ret = 1;
+    FILE *f = fopen(out, "wb");  // truncates, unlike the old O_CREAT-only open
+    if (!f) {
+        perror(out);
+    } else {
+        size_t w = fwrite((char *)ub.buf + off, 1, n, f);
+        if (fclose(f) != 0 || w != n)
+            perror(out);
+        else {
+            printf("Dumped 0x%zx bytes of %s (offset 0x%zx) to %s\n", n, ub.name, off, out);
+            ret = 0;
+        }
+    }
+    udmabuf_close(&ub);
+    return ret;
 }
